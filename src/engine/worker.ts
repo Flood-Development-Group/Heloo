@@ -5,7 +5,7 @@ import { renderJob, handleVoiceMessage, type VoiceMessage } from './dispatch';
 export type WorkerIn = { type: 'jobs'; jobs: RenderJob[] } | VoiceMessage;
 
 export type WorkerOut =
-  | { type: 'done'; key: string; samples: Float32Array }
+  | { type: 'done'; key: string; samples: Float32Array; phonemes?: Record<string, string[]> }
   | { type: 'error'; key: string; message: string }
   | { type: 'idle' }
   | { type: 'voice'; id: string; ok: boolean; message: string; info?: unknown };
@@ -24,8 +24,8 @@ async function pump(): Promise<void> {
   while (queue.length > 0) {
     const job = queue.shift()!;
     try {
-      const samples = await renderJob(job);
-      scope.postMessage({ type: 'done', key: job.key, samples }, [samples.buffer]);
+      const { samples, phonemes } = await renderJob(job);
+      scope.postMessage({ type: 'done', key: job.key, samples, ...(phonemes ? { phonemes } : {}) }, [samples.buffer]);
     } catch (err) {
       scope.postMessage({ type: 'error', key: job.key, message: err instanceof Error ? err.message : String(err) });
     }

@@ -39,6 +39,8 @@ export class RenderManager {
   private lastProject: Project | null = null;
   private priorityTime = 0;
   private readonly voiceWaiters = new Map<string, (r: VoiceReply) => void>();
+  /** Phonemes reported by the renderer, by phrase key then note id. */
+  private readonly sungPhonemes = new Map<string, Map<string, string[]>>();
 
   constructor(private readonly createWorker: () => Worker | null) {}
 
@@ -111,6 +113,7 @@ export class RenderManager {
     while (this.unused.length > RETAIN_UNUSED) {
       const k = this.unused.shift()!;
       this.audio.delete(k);
+      this.sungPhonemes.delete(k);
     }
     for (const key of [...this.errors.keys()]) if (!wanted.has(key)) this.errors.delete(key);
 
@@ -135,8 +138,8 @@ export class RenderManager {
     for (const job of jobs) {
       if (!this.pending.has(job.key)) continue;
       try {
-        const samples = await renderJob(job);
-        this.onMessage({ type: 'done', key: job.key, samples });
+        const { samples, phonemes } = await renderJob(job);
+        this.onMessage({ type: 'done', key: job.key, samples, ...(phonemes ? { phonemes } : {}) });
       } catch (err) {
         this.onMessage({ type: 'error', key: job.key, message: err instanceof Error ? err.message : String(err) });
       }
@@ -150,6 +153,7 @@ export class RenderManager {
       this.pending.delete(msg.key);
       if (!job) return;
       this.audio.set(msg.key, { key: msg.key, trackId: job.trackId, start: job.start, samples: msg.samples, sampleRate: job.sampleRate });
+      if (msg.phonemes) this.sungPhonemes.set(msg.key, new Map(Object.entries(msg.phonemes)));
       this.emit('ready', msg.key);
       this.emit('status');
     } else if (msg.type === 'error') {
@@ -180,6 +184,17 @@ export class RenderManager {
     return new Promise((resolve) => {
       this.voiceWaiters.set(id, resolve);
       worker.postMessage({ type: 'loadVoicebank', id, files } satisfies WorkerIn, Object.values(files));
+    });
+  }
+
+  /** Sends a vocoder package (.oudep/.zip) to the worker for voicebanks that do not include one. */
+  loadVocoder(files: Record<string, ArrayBuffer>): Promise<VoiceReply> {
+    const worker = this.ensureWorker();
+    const id = `vocoder:${Date.now()}`;
+    if (!worker) return Promise.resolve({ type: 'voice', id, ok: false, message: 'Background rendering is not available in this browser.' });
+    return new Promise((resolve) => {
+      this.voiceWaiters.set(id, resolve);
+      worker.postMessage({ type: 'loadVocoder', id, files } satisfies WorkerIn, Object.values(files));
     });
   }
 
@@ -230,7 +245,13 @@ export class RenderManager {
   phonemes(noteId: string): string[] | undefined {
     for (const tp of this.plans) {
       const p = tp.phonemes.get(noteId);
-      if (p) return p;
+      if (!p) continue;
+      // Neural voices report the voicebank phonemes they actually sang.
+      for (const j of tp.jobs) {
+        const sung = this.sungPhonemes.get(j.key)?.get(noteId);
+        if (sung) return sung;
+      }
+      return p;
     }
     return undefined;
   }

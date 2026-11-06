@@ -58,13 +58,33 @@ export interface VoicebankData {
   vocoderConfig: VocoderConfig;
   vocoderModel: Uint8Array;
   speakerEmbed: Float32Array | null;
+  /** Optional variance model (dsvariance) that predicts energy/breathiness/voicing/tension curves. */
+  variance: VarianceData | null;
   warnings: string[];
+}
+
+export interface VarianceData {
+  linguisticModel: Uint8Array;
+  varianceModel: Uint8Array;
+  phonemes: Map<string, number>;
+  languages: Map<string, number> | null;
 }
 
 export class VoicebankError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'VoicebankError';
+  }
+}
+
+/** Thrown when a voicebank is fine but no vocoder is available for it. */
+export class VocoderMissingError extends VoicebankError {
+  constructor(
+    message: string,
+    readonly vocoderName: string | null,
+  ) {
+    super(message);
+    this.name = 'VocoderMissingError';
   }
 }
 
@@ -108,6 +128,7 @@ function yamlFile<T>(files: Files, path: string): T {
 
 /** Unzips and normalises paths (forward slashes, no leading "./", macOS metadata removed). */
 export function unzipVoicebank(zip: Uint8Array): Files {
+  // .oudep vocoder packages are zip files too.
   let raw: Record<string, Uint8Array>;
   try {
     raw = unzipSync(zip, { filter: (f) => !f.name.startsWith('__MACOSX/') && !f.name.endsWith('/') && !/(^|\/)\.DS_Store$/.test(f.name) });
@@ -117,6 +138,18 @@ export function unzipVoicebank(zip: Uint8Array): Files {
   const files: Files = {};
   for (const [name, data] of Object.entries(raw)) files[name.replace(/\\/g, '/').replace(/^\.\//, '')] = data;
   return files;
+}
+
+export function parseVocoderYaml(b: Uint8Array): VocoderConfig {
+  let cfg: unknown;
+  try {
+    cfg = parseYaml(text(b).replace(/^\uFEFF/, ''));
+  } catch (err) {
+    throw new VoicebankError(`Could not read vocoder.yaml: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const c = cfg as VocoderConfig | null;
+  if (!c || typeof c.model !== 'string') throw new VoicebankError('vocoder.yaml does not name a model file.');
+  return c;
 }
 
 function parsePhonemes(b: Uint8Array, path: string): Map<string, number> {
@@ -135,7 +168,7 @@ function parsePhonemes(b: Uint8Array, path: string): Map<string, number> {
   return map;
 }
 
-function parseDict(files: Files, path: string): DictData {
+function parseYamlDict(files: Files, path: string): DictData {
   const raw = yamlFile<{ entries?: { grapheme?: unknown; phonemes?: unknown }[]; symbols?: { symbol?: unknown; type?: unknown }[] }>(files, path) ?? {};
   const entries = new Map<string, string[]>();
   for (const e of raw.entries ?? []) {
@@ -145,6 +178,35 @@ function parseDict(files: Files, path: string): DictData {
   const types = new Map<string, string>();
   for (const s of raw.symbols ?? []) if (typeof s?.symbol === 'string' && typeof s.type === 'string') types.set(s.symbol, s.type);
   return { entries, types };
+}
+
+/** Plain-text dictionary (dsdict.txt / dictionary.txt): "grapheme<TAB>ph1 ph2" per line. */
+function parseTextDict(b: Uint8Array): DictData {
+  const entries = new Map<string, string[]>();
+  for (const line of text(b).replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const tab = t.indexOf('\t');
+    const [g, rest] = tab >= 0 ? [t.slice(0, tab), t.slice(tab + 1)] : [t.split(/\s+/)[0], t.split(/\s+/).slice(1).join(' ')];
+    const phs = rest.trim().split(/\s+/).filter(Boolean);
+    if (g && phs.length) entries.set(g.toLowerCase(), phs);
+  }
+  return { entries, types: new Map() };
+}
+
+/**
+ * When a dictionary has no symbol types, infer vowels: syllable dictionaries (pinyin, kana) end
+ * every entry with its vowel, so the last phoneme of each entry is a vowel and the rest are not.
+ */
+function inferTypes(d: DictData): void {
+  if (d.types.size > 0) return;
+  const last = new Set<string>();
+  const other = new Set<string>();
+  for (const phs of d.entries.values()) {
+    phs.forEach((p, i) => (i === phs.length - 1 ? last : other).add(p));
+  }
+  for (const p of last) d.types.set(p, 'vowel');
+  for (const p of other) if (!last.has(p)) d.types.set(p, 'consonant');
 }
 
 /**
@@ -186,35 +248,58 @@ export function readVoicebank(files: Files, extra: Files = {}): VoicebankData {
     } else warnings.push(`Language list ${cfg.languages} is missing; language ids are set to 0.`);
   }
 
-  // Dictionaries: dsdict.yaml and dsdict-<lang>.yaml next to the config or at the zip root.
+  // Dictionaries, by language key ("" = default). Preference: dsdict(-lang).yaml next to the
+  // acoustic config, then plain-text dsdict.txt / dictionary.txt, then the dsdict.yaml files of
+  // the voicebank's dsdur/dspitch/dsvariance folders. Symbol types are merged from all YAML dicts.
   const dicts = new Map<string, DictData>();
-  for (const path of Object.keys(all)) {
-    const m = /(^|\/)dsdict(?:-([a-z]{2,3}))?\.yaml$/i.exec(path);
-    if (!m) continue;
-    if (dirname(path) !== root && dirname(path) !== '' && !root.startsWith(dirname(path))) continue;
-    const key = (m[2] ?? '').toLowerCase();
-    if (!dicts.has(key)) dicts.set(key, parseDict(all, path));
+  const inRoot = (path: string) => path.startsWith(root) && !path.slice(root.length).includes('/');
+  const underRoot = (path: string) => path.startsWith(root);
+  const yamlDicts = Object.keys(all)
+    .map((path) => ({ path, m: /(^|\/)dsdict(?:-([a-z]{2,3}))?\.yaml$/i.exec(path) }))
+    .filter((x) => x.m && underRoot(x.path))
+    .sort((a, b) => Number(inRoot(b.path)) - Number(inRoot(a.path)) || a.path.length - b.path.length);
+  const allTypes = new Map<string, string>();
+  for (const { path, m } of yamlDicts) {
+    const d = parseYamlDict(all, path);
+    for (const [k, v] of d.types) if (!allTypes.has(k)) allTypes.set(k, v);
+    const key = (m![2] ?? '').toLowerCase();
+    if (inRoot(path) && !dicts.has(key)) dicts.set(key, d);
   }
-  if (dicts.size === 0) warnings.push('No dsdict.yaml found: lyrics are converted with the built-in dictionary, which may not match this voicebank’s phonemes. Phoneme overrides always work.');
+  if (!dicts.has('')) {
+    const txtPath = Object.keys(all).find((k) => inRoot(k) && /(^|\/)(dsdict|dictionary)\.txt$/i.test(k));
+    if (txtPath) dicts.set('', parseTextDict(all[txtPath]));
+    else if (yamlDicts.length > 0) dicts.set('', parseYamlDict(all, yamlDicts[0].path));
+  }
+  for (const d of dicts.values()) {
+    for (const [k, v] of allTypes) if (!d.types.has(k)) d.types.set(k, v);
+    inferTypes(d);
+  }
+  if (dicts.size === 0) warnings.push('No dictionary (dsdict.yaml or dsdict.txt) found: lyrics are converted with the built-in dictionary, which may not match this voicebank’s phonemes. Phoneme overrides always work.');
 
-  // Vocoder: a vocoder.yaml anywhere in the files.
-  const vocPaths = Object.keys(all).filter((k) => /(^|\/)vocoder\.yaml$/i.test(k));
-  let vocoderConfig: VocoderConfig | null = null;
-  let vocoderModel: Uint8Array | undefined;
-  for (const vp of vocPaths) {
+  // Vocoder: a vocoder.yaml in the voicebank or in a separately imported vocoder package.
+  // Prefer the one named by dsconfig, then any whose audio format matches the acoustic model.
+  const vocoders: { vc: VocoderConfig; model: Uint8Array; score: number }[] = [];
+  for (const vp of Object.keys(all).filter((k) => /(^|\/)vocoder\.yaml$/i.test(k))) {
     const vc = yamlFile<VocoderConfig>(all, vp);
     if (!vc || typeof vc.model !== 'string') continue;
     const model = findFile(all, joinPath(dirname(vp), vc.model));
-    if (model) {
-      vocoderConfig = vc;
-      vocoderModel = model;
-      break;
-    }
+    if (!model) continue;
+    const sameFormat =
+      (vc.sample_rate ?? 44100) === (cfg.sample_rate ?? 44100) && (vc.hop_size ?? 512) === (cfg.hop_size ?? 512) && (vc.num_mel_bins ?? 128) === (cfg.num_mel_bins ?? 128);
+    vocoders.push({ vc, model, score: (vc.name === cfg.vocoder ? 2 : 0) + (sameFormat ? 1 : 0) + (underRoot(vp) ? 0.5 : 0) });
   }
-  if (!vocoderConfig || !vocoderModel) {
-    throw new VoicebankError(
-      `This voicebank needs a vocoder${cfg.vocoder ? ` (“${cfg.vocoder}”)` : ''}. Add the vocoder folder (vocoder.yaml and its .onnx file) to the zip and import it again.`,
+  vocoders.sort((a, b) => b.score - a.score);
+  const best = vocoders[0];
+  if (!best) {
+    throw new VocoderMissingError(
+      `This voicebank needs a vocoder${cfg.vocoder ? ` (“${cfg.vocoder}”)` : ''}. Import a vocoder package (.oudep or .zip with vocoder.yaml and its .onnx) and try again.`,
+      cfg.vocoder ?? null,
     );
+  }
+  const vocoderConfig = best.vc;
+  const vocoderModel = best.model;
+  if (cfg.vocoder && vocoderConfig.name && vocoderConfig.name !== cfg.vocoder) {
+    warnings.push(`Using vocoder “${vocoderConfig.name}” instead of “${cfg.vocoder}” (same audio format).`);
   }
   const sr = cfg.sample_rate ?? 44100;
   const hop = cfg.hop_size ?? 512;
@@ -233,22 +318,51 @@ export function readVoicebank(files: Files, extra: Files = {}): VoicebankData {
     } else warnings.push(`Speaker embedding ${name}.emb is missing.`);
   }
 
-  const charFile = findFile(all, joinPath(root, 'character.yaml')) ?? findFile(all, 'character.yaml');
+  // Name: character.yaml "name", else character.txt "name=", else the folder name.
   let name = root.replace(/\/$/, '').split('/').pop() || 'Voicebank';
-  if (charFile) {
+  const charYaml = findFile(all, joinPath(root, 'character.yaml'));
+  const charTxt = findFile(all, joinPath(root, 'character.txt'));
+  let named = false;
+  if (charYaml) {
     try {
-      const c = parseYaml(text(charFile)) as { name?: unknown };
-      if (typeof c?.name === 'string' && c.name.trim()) name = c.name.trim();
+      const c = parseYaml(text(charYaml).replace(/^\uFEFF/, '')) as { name?: unknown };
+      if (typeof c?.name === 'string' && c.name.trim()) {
+        name = c.name.trim();
+        named = true;
+      }
     } catch {
-      // keep the folder name
+      // fall through
     }
-  } else {
-    const txt = findFile(all, joinPath(root, 'character.txt')) ?? findFile(all, 'character.txt');
-    const m = txt ? /^name\s*=\s*(.+)$/m.exec(text(txt)) : null;
+  }
+  if (!named && charTxt) {
+    const m = /^\s*name\s*=\s*(.+)$/m.exec(text(charTxt).replace(/^\uFEFF/, ''));
     if (m) name = m[1].trim();
   }
 
-  return { name, root, config: cfg, phonemes, languages, dicts, acousticModel, vocoderConfig, vocoderModel, speakerEmbed, warnings };
+  // Variance model: a dsconfig.yaml under the voicebank naming "linguistic" and "variance" models.
+  let variance: VarianceData | null = null;
+  for (const path of configs) {
+    if (!path.startsWith(root) || path === chosen.path) continue;
+    const vc = yamlFile<{ linguistic?: unknown; variance?: unknown; phonemes?: unknown; use_lang_id?: unknown; languages?: unknown }>(all, path);
+    if (!vc || typeof vc.linguistic !== 'string' || typeof vc.variance !== 'string' || typeof vc.phonemes !== 'string') continue;
+    const dir = dirname(path);
+    const ling = findFile(all, joinPath(dir, vc.linguistic));
+    const vari = findFile(all, joinPath(dir, vc.variance));
+    const phb = findFile(all, joinPath(dir, vc.phonemes));
+    if (!ling || !vari || !phb) {
+      warnings.push(`The variance model in ${dir || 'the voicebank'} is incomplete and is not used.`);
+      continue;
+    }
+    let vlangs: Map<string, number> | null = null;
+    if (vc.use_lang_id === true && typeof vc.languages === 'string') {
+      const lb = findFile(all, joinPath(dir, vc.languages));
+      if (lb) vlangs = new Map(Object.entries(JSON.parse(text(lb)) as Record<string, number>).filter(([, v]) => typeof v === 'number'));
+    }
+    variance = { linguisticModel: ling, varianceModel: vari, phonemes: parsePhonemes(phb, joinPath(dir, vc.phonemes)), languages: vlangs };
+    break;
+  }
+
+  return { name, root, config: cfg, phonemes, languages, dicts, acousticModel, vocoderConfig, vocoderModel, speakerEmbed, variance, warnings };
 }
 
 const CONSONANT_DURATION: Record<string, number> = {

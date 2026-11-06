@@ -595,14 +595,49 @@ export class App {
     this.roll.fitToNotes();
   }
 
+  /** Imports a vocoder package (.oudep or .zip). Returns true when it loaded. */
+  private async importVocoder(file?: File | null): Promise<boolean> {
+    const f = file ?? (await pickFile());
+    if (!f) return false;
+    toast(`Loading vocoder “${f.name}”…`, 60000);
+    try {
+      const reply = await this.render.loadVocoder({ 'vocoder.zip': await f.arrayBuffer() });
+      if (!reply.ok) {
+        toast('Vocoder not loaded', 1000);
+        void alertDialog('Could not load vocoder', reply.message);
+        return false;
+      }
+      const info = (reply.info ?? {}) as { name?: string };
+      toast(`Vocoder loaded: ${info.name ?? f.name}`);
+      return true;
+    } catch (err) {
+      void alertDialog('Could not load vocoder', err instanceof Error ? err.message : String(err));
+      return false;
+    }
+  }
+
   private async importVoicebank(): Promise<void> {
     const file = await pickFile('.zip,application/zip');
     if (!file) return;
     const id = `ds:${safeFilename(file.name.replace(/\.zip$/i, '')).replace(/\s+/g, '_')}`;
-    toast(`Loading voicebank “${file.name}”…`, 120000);
+    toast(`Loading voicebank “${file.name}”… (large models can take a minute)`, 180000);
     try {
-      const buf = await file.arrayBuffer();
-      const reply = await this.render.loadVoicebank(id, { 'voicebank.zip': buf });
+      let reply = await this.render.loadVoicebank(id, { 'voicebank.zip': await file.arrayBuffer() });
+      if (!reply.ok && reply.code === 'vocoder-missing') {
+        toast('Voicebank needs a vocoder', 1000);
+        const v = await showDialog(
+          'Vocoder needed',
+          `${reply.message}\n\nOpenUtau installs vocoders separately (for example an NSF-HiFiGAN .oudep package). Import one now? Heloo keeps it for the rest of this session.`,
+          [
+            { label: 'Cancel', value: '' },
+            { label: 'Choose vocoder…', value: 'pick', primary: true },
+          ],
+        );
+        if (v !== 'pick' || !(await this.importVocoder())) return;
+        toast(`Loading voicebank “${file.name}”…`, 180000);
+        // The first buffer was transferred to the worker, so read the file again.
+        reply = await this.render.loadVoicebank(id, { 'voicebank.zip': await file.arrayBuffer() });
+      }
       if (!reply.ok) {
         toast('Voicebank not loaded', 1000);
         void alertDialog('Could not load voicebank', reply.message);
@@ -694,6 +729,7 @@ export class App {
       item('Export MIDI', () => void this.exportMidi()),
       h('hr'),
       item('Import neural voicebank (.zip)…', () => void this.importVoicebank()),
+      item('Import vocoder (.oudep/.zip)…', () => void this.importVocoder()),
       item(`${s.pencilOnly ? '✓ ' : ''}Pencil edits, finger scrolls`, () => {
         s.pencilOnly = !s.pencilOnly;
         s.savePrefs();

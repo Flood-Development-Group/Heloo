@@ -95,17 +95,46 @@ Inside `src/engine/`:
 
 ## Neural voicebanks (experimental)
 
-Use *Menu → Import neural voicebank (.zip)*. The zip must contain:
+Use *Menu → Import neural voicebank (.zip)* to add a DiffSinger voicebank in the layout OpenUtau uses. Heloo reads:
 
-- `dsconfig.yaml` with `acoustic:` and `phonemes:` entries, plus the acoustic `.onnx` model and phoneme list.
-- A vocoder folder with `vocoder.yaml` and its `.onnx` (for example NSF-HiFiGAN). OpenUtau often installs the vocoder separately; put it in the zip.
-- Optionally, `dsdict.yaml` (or `dsdict-<lang>.yaml`) to map lyrics to the voicebank's phonemes.
+- **`dsconfig.yaml`:** must name the acoustic `.onnx` model and the phoneme list (`phonemes.txt` or `.json`).
+- **Dictionary:** `dsdict.yaml` / `dsdict-<lang>.yaml`, or plain-text `dsdict.txt` / `dictionary.txt`. If neither is at the top level, it uses the `dsdict.yaml` inside the `dsdur` / `dspitch` / `dsvariance` folders. Lyrics are looked up in the voicebank's own dictionary first, so a Mandarin voicebank takes pinyin lyrics such as `ni`, `hao`.
+- **Variance model** (optional, `dsvariance`): when the acoustic model needs energy or breathiness curves, Heloo runs the voicebank's variance model to predict them. If there's no variance model, it approximates them, staying silent during rests.
+- **Vocoder:** voicebanks usually rely on a separately installed vocoder such as NSF-HiFiGAN. If yours has none, Heloo asks you to import one (an OpenUtau `.oudep` package or a `.zip` containing `vocoder.yaml` and its `.onnx`). You can also use *Menu → Import vocoder*. If the name in `dsconfig` doesn't match, Heloo uses a vocoder with the same sample rate, hop size and mel bins.
 
-Heloo uses its own rules for phoneme timing and its own pitch model. It does not run the voicebank's optional duration, pitch or variance models. If an acoustic model requires energy, breathiness, voicing or tension curves, Heloo approximates them from its own curves.
+Heloo uses its own timing rules and pitch model. It doesn't run a voicebank's duration (`dsdur`) or pitch (`dspitch`) models.
 
-**What has been verified:** the zip/config/dictionary reader, tokenisation and frame timing, and the ONNX Runtime calls. Unit tests cover them in Node, and the e2e test covers them in the browser build. Both use generated stand-in models that have the DiffSinger input/output interface. **No real voicebank has been tested yet**, so expect rough edges with real models. Model formats vary between DiffSinger versions. Rendering is CPU-only (WebAssembly, single thread), which is slow for large models. Imported voicebanks are kept only for the current session, so re-import after relaunching.
+**Tested with real voicebanks** (November 2026):
 
-Respect each voicebank's license and terms of use.
+| Voicebank | Language | Licence | Notes |
+| --- | --- | --- | --- |
+| `opencpopJPN` | Mandarin | MIT repo, Opencpop data | Acoustic model only |
+| `白溺 (Baini) DiffSinger Lite 0.1` | Mandarin | CC BY-NC 4.0, no redistribution | Also has duration, pitch and variance models |
+
+The vocoder was OpenVPI's PC-NSF-HiFiGAN 2025.02 (CC BY-NC-SA 4.0).
+
+What was checked:
+
+- Both voicebanks load and render in Node and in the browser build.
+- On a four-note pinyin phrase, every note was within 20 cents of the written pitch.
+- Rests stay silent.
+- The piano roll shows the voicebank's phonemes.
+- The browser test also covers the vocoder prompt and WAV export.
+
+The audio quality wasn't judged by ear.
+
+**Performance:** ONNX Runtime Web runs on the CPU (WebAssembly, one thread). Loading a voicebank takes about 10–20 s, and rendering is about 10× slower than real time: around 25 s for a 2.6 s phrase in this test environment. iPads may be faster or slower than that.
+
+Imported voicebanks and vocoders last only for the current session. Respect each voicebank's terms: most are non-commercial, require credit, and forbid redistribution. Don't host them with the app.
+
+### Testing with your own voicebanks
+
+```sh
+# Node: every *.zip in the folder, plus a vocoder folder or .oudep inside it
+HELOO_VOICEBANK_DIR=/path/to/voicebanks npx vitest run tests/real-voicebank.test.ts
+# Browser (build first)
+npm run build && HELOO_VOICEBANK=/path/vb.zip HELOO_VOCODER=/path/vocoder.oudep node e2e/real-voicebank.mjs
+```
 
 ## Known limitations
 
