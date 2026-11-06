@@ -1,0 +1,27 @@
+{
+  "name": "heloo-vocal-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Touch-first singing voice synthesis editor for iPad. Runs fully on-device.",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host --port 4173",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "e2e": "npm run build && node e2e/run.mjs",
+    "icons": "node scripts/make-icons.mjs"
+  },
+  "dependencies": {
+    "cmu-pronouncing-dictionary": "3.0.0",
+    "fflate": "0.8.2",
+    "onnxruntime-web": "1.22.0",
+    "yaml": "2.8.1"
+  },
+  "devDependencies": {
+    "typescript": "5.8.3",
+    "vite": "6.3.5",
+    "vitest": "3.2.4"
+  }
+}
